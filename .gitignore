@@ -1,0 +1,19 @@
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Mac OS
+.DS_Store
+
+# Environment Variables
+.env
+
+# Editor directories and files
+.vscode
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

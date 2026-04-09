@@ -1,0 +1,13 @@
+{
+  "name": "worker-node",
+  "version": "1.0.0",
+  "description": "ScaleNet Worker Node - simulates backend processing",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "morgan": "^1.10.0"
+  }
+}
