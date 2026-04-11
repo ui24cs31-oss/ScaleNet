@@ -7,20 +7,19 @@ const activeWorkers = new Map();
 
 // Since you already have worker-1 (4001) and worker-2 (4002) running manually,
 // we will start generating from worker-3 on port 4003.
-let nextPort = 4003; 
-let workerCounter = 3;
+let nextPort = 4001; 
 
 /**
- * Spawns a new Docker container, then registers it with the Load Balancer
+ * Spawns a new Docker container, then assumes heartbeat will handle registration
  */
-async function spawnWorker() {
-  const port = nextPort++;
-  const workerId = `worker-${workerCounter++}`;
+async function spawnWorker(type = 'batch', workerIdStr = null, forcedPort = null) {
+  const port = forcedPort || nextPort++;
+  const workerId = workerIdStr || `${type}-${port}`;
   
   console.log(`[WorkerManager] Spawning ${workerId} on port ${port}...`);
 
-  // Run the exact same docker command you ran in the terminal!
-  const cmd = `docker run -d --network scalenet-network --name ${workerId} -p ${port}:4001 -e PORT=4001 -e WORKER_ID=${workerId} scalenet-worker`;
+  // We must pass LB_URL=http://host.docker.internal:3000 so the container can heartbeat back to the host!
+  const cmd = `docker run -d --name ${workerId} -p ${port}:${port} -e PORT=${port} -e WORKER_ID=${workerId} -e WORKER_TYPE=${type} -e LB_URL=http://host.docker.internal:3000 scalenet-worker`;
   
   try {
     const { stdout, stderr } = await exec(cmd);
@@ -29,15 +28,8 @@ async function spawnWorker() {
     activeWorkers.set(workerId, port);
     console.log(`[WorkerManager] Container ${workerId} started (ID: ${stdout.trim().substring(0, 12)})`);
 
-    // Wait 1.5 seconds to give the NodeJS Express server inside the container time to boot up
-    await new Promise(resolve => setTimeout(resolve, 1500));
-
-    // Tell the Load Balancer to add it to its address book!
-    // Because the LB is running on your host PC right now, it needs to contact it via localhost:4003
-    const url = `http://localhost:${port}`; 
-    
-    await axios.post('http://localhost:3000/register', { id: workerId, url });
-    console.log(`[WorkerManager] Registered ${workerId} with Load Balancer at ${url}`);
+    // No need to manually post to /register anymore! Heartbeat handles it!
+    console.log(`[WorkerManager] Relying on Heartbeat to register ${workerId} ...`);
     
     return { workerId, port, status: 'spawned' };
   } catch (err) {
