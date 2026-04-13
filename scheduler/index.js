@@ -1,8 +1,93 @@
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 // ─── Constants & Structures ──────────────────────────────────────────
-const MAX_QUEUE_SIZE = 100;
+const MAX_QUEUE_SIZES = {
+  interactive: 50,
+  compute: 100,
+  batch: 500
+};
 const TASK_TIMEOUT_MS = 8000;
+
+// ─── Metrics State (5-second snapshot) ───────────────────────────────────
+let intervalMetrics = {
+  interactive: { receivedThisInterval: 0, droppedByAdmission: 0, rejectedByWorkers: 0, completed: 0, totalLatency: 0 },
+  compute: { receivedThisInterval: 0, droppedByAdmission: 0, rejectedByWorkers: 0, completed: 0, totalLatency: 0 },
+  batch: { receivedThisInterval: 0, droppedByAdmission: 0, rejectedByWorkers: 0, completed: 0, totalLatency: 0 },
+  system: { totalReceivedThisInterval: 0, totalDroppedThisInterval: 0 }
+};
+
+let metricsSnapshot = { timestamp: Date.now() }; // Initialize blank
+
+setInterval(() => {
+  const iRatio = pools.interactive.queueDepth / MAX_QUEUE_SIZES.interactive;
+  const cRatio = pools.compute.queueDepth / MAX_QUEUE_SIZES.compute;
+  const bRatio = pools.batch.queueDepth / MAX_QUEUE_SIZES.batch;
+  const weightedPressure = ((iRatio * 3) + (cRatio * 2) + (bRatio * 1)) / 6;
+
+  const buildPoolMetrics = (type, ratio) => {
+    let activeWorkers = 0;
+    let idleWorkers = 0;
+    for (const w of pools[type].workerMap.values()) {
+       if (w.healthy) {
+           activeWorkers += w.activeConnections > 0 ? 1 : 0;
+           idleWorkers += w.activeConnections === 0 ? 1 : 0;
+       }
+    }
+    const internal = intervalMetrics[type];
+    const snap = {
+        queueDepth: pools[type].queueDepth,
+        activeWorkers,
+        idleWorkers,
+        receivedThisInterval: internal.receivedThisInterval,
+        droppedByAdmission: internal.droppedByAdmission,
+        rejectedByWorkers: internal.rejectedByWorkers,
+        pressure: parseFloat(ratio.toFixed(2))
+    };
+    if (type !== 'batch') {
+        snap.avgLatency = internal.completed > 0 ? Math.round(internal.totalLatency / internal.completed) : 0;
+    }
+    return snap;
+  };
+
+  metricsSnapshot = {
+     timestamp: Date.now(),
+     interactive: buildPoolMetrics('interactive', iRatio),
+     compute: buildPoolMetrics('compute', cRatio),
+     batch: buildPoolMetrics('batch', bRatio),
+     system: {
+        totalReceivedThisInterval: intervalMetrics.system.totalReceivedThisInterval,
+        totalDroppedThisInterval: intervalMetrics.system.totalDroppedThisInterval,
+        weightedPressure: parseFloat(weightedPressure.toFixed(2))
+     }
+  };
+
+  for (const type of ['interactive', 'compute', 'batch']) {
+     intervalMetrics[type] = { receivedThisInterval: 0, droppedByAdmission: 0, rejectedByWorkers: 0, completed: 0, totalLatency: 0 };
+  }
+  intervalMetrics.system = { totalReceivedThisInterval: 0, totalDroppedThisInterval: 0 };
+
+  const logFile = path.join(__dirname, '../logs/metrics.jsonl');
+  fs.appendFile(logFile, JSON.stringify(metricsSnapshot) + '\n', (err) => {
+      if (err) console.error('[Scheduler] Failed to write metrics to disk:', err);
+  });
+}, 5000);
+
+function recordMetric(poolType, metricName, value = 1) {
+    if (intervalMetrics[poolType] && intervalMetrics[poolType][metricName] !== undefined) {
+        intervalMetrics[poolType][metricName] += value;
+    }
+    if (metricName === 'receivedThisInterval') {
+        intervalMetrics.system.totalReceivedThisInterval += value;
+    } else if (metricName === 'droppedByAdmission') {
+        intervalMetrics.system.totalDroppedThisInterval += value;
+    }
+}
+
+function getMetricsSnapshot() {
+    return metricsSnapshot;
+}
 
 function createPoolState() {
   return {
@@ -10,7 +95,8 @@ function createPoolState() {
     eligibleArray: [],
     eligibleSet: new Set(),
     inFlight: new Map(), // Used explicitly for compute complexity tracking
-    rrIndex: 0           // Used strictly by batch pool
+    rrIndex: 0,          // Used strictly by batch pool
+    queueDepth: 0        // Track requests waiting in queue
   };
 }
 
@@ -232,6 +318,7 @@ function dispatch() {
     const worker = selectInteractiveWorker();
     if (!worker) break;
     const task = queues.interactive.shift();
+    pools.interactive.queueDepth--;
     clearTimeout(task.timeoutHandle);
     sendRequest(worker, task);
   }
@@ -241,6 +328,7 @@ function dispatch() {
     const worker = selectComputeWorker();
     if (!worker) break;
     const task = queues.compute.shift();
+    pools.compute.queueDepth--;
     clearTimeout(task.timeoutHandle);
     sendRequest(worker, task);
   }
@@ -250,6 +338,7 @@ function dispatch() {
     const worker = selectBatchWorker();
     if (!worker) break;
     const task = queues.batch.shift();
+    pools.batch.queueDepth--;
     clearTimeout(task.timeoutHandle);
     sendRequest(worker, task);
   }
@@ -285,6 +374,7 @@ async function sendRequest(worker, task) {
     if (task.type === 'batch') {
         // Resolve early for batch queue as per spec (fire & forget)
         task.resolve({ status: 'accepted', message: 'Dispatched to batch worker', handledBy: worker.id });
+        recordMetric('batch', 'completed');
     }
 
     const axTimeout = task.type === 'compute' ? 60000 : 10000;
@@ -295,6 +385,8 @@ async function sendRequest(worker, task) {
             ...response.data,
             handledBy: worker.id
         });
+        recordMetric(task.type, 'completed');
+        recordMetric(task.type, 'totalLatency', Date.now() - task.enqueuedAt);
     }
   } catch (err) {
     const errorMsg = err.response ? `HTTP ${err.response.status}` : (err.code || err.message);
@@ -303,6 +395,7 @@ async function sendRequest(worker, task) {
     
     console.error(`[Scheduler] Worker ${worker.id} failed task ${task.id}: ${finalReason}`);
     if (task.type !== 'batch') {
+        recordMetric(task.type, 'rejectedByWorkers');
         task.reject({ error: 'Worker failed', worker: worker.id, reason: finalReason });
     }
   } finally {
@@ -337,6 +430,32 @@ function onRequestComplete(workerId, poolType, taskId) {
     dispatch(); 
 }
 
+// ─── Admission Control ──────────────────────────────────────────────
+function checkAdmission(poolType) {
+  const iRatio = pools.interactive.queueDepth / MAX_QUEUE_SIZES.interactive;
+  const cRatio = pools.compute.queueDepth / MAX_QUEUE_SIZES.compute;
+  const bRatio = pools.batch.queueDepth / MAX_QUEUE_SIZES.batch;
+
+  const weightedPressure = ((iRatio * 3) + (cRatio * 2) + (bRatio * 1)) / 6;
+
+  let reject = false;
+  const retryAfter = 30; // 30 seconds for all 3 rejection states as requested
+
+  if (weightedPressure > 0.95) {
+    reject = true;
+  } else if (weightedPressure >= 0.90 && weightedPressure <= 0.95) {
+    if (poolType === 'batch' || poolType === 'compute') {
+      reject = true;
+    }
+  } else if (weightedPressure >= 0.70 && weightedPressure < 0.90) {
+    if (poolType === 'batch') {
+      reject = true;
+    }
+  }
+
+  return reject ? { accept: false, retryAfter } : { accept: true };
+}
+
 // ─── Enqueue ─────────────────────────────────────────────────────────
 function enqueue(taskData) {
   const type = taskData.type || 'batch';
@@ -346,7 +465,9 @@ function enqueue(taskData) {
        return reject({ error: 'Invalid task type', type });
     }
 
-    if (queues[type].length >= MAX_QUEUE_SIZE) {
+    const maxSize = MAX_QUEUE_SIZES[type] || 100;
+    if (queues[type].length >= maxSize) {
+      recordMetric(type, 'rejectedByWorkers');
       return reject({ error: 'Queue full', type, queueSize: queues[type].length });
     }
 
@@ -358,7 +479,12 @@ function enqueue(taskData) {
     }
 
     const timeoutHandle = setTimeout(() => {
+      const origSize = queues[type].length;
       queues[type] = queues[type].filter(t => t.id !== taskId);
+      if (queues[type].length < origSize) {
+        pools[type].queueDepth--;
+      }
+      recordMetric(type, 'rejectedByWorkers');
       reject({ error: 'Task timed out', taskId, type });
     }, TASK_TIMEOUT_MS);
 
@@ -369,6 +495,7 @@ function enqueue(taskData) {
       reject, 
       timeoutHandle 
     });
+    pools[type].queueDepth++; // Increment when waiting for a worker
     
     dispatch();
   });
@@ -409,5 +536,8 @@ module.exports = {
     getStatus, 
     onHeartbeat,
     setAlgorithm,
-    getAlgorithm
+    getAlgorithm,
+    checkAdmission,
+    recordMetric,
+    getMetricsSnapshot
 };

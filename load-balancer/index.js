@@ -1,7 +1,13 @@
 const express   = require('express');
 const morgan    = require('morgan');
 const cors      = require('cors');
+const fs        = require('fs');
+const path      = require('path');
 const scheduler = require('../scheduler');
+
+// Ensure logs directory exists
+const logDir = path.join(__dirname, '../logs');
+fs.mkdirSync(logDir, { recursive: true });
 
 const app = express();
 app.use(cors());
@@ -43,6 +49,20 @@ app.post('/task', async (req, res) => {
     taskType = type.toLowerCase();
   }
 
+  // Gateway admission check before hitting scheduler (saves garbage collection under DDoS)
+  scheduler.recordMetric(taskType, 'receivedThisInterval');
+
+  const admission = scheduler.checkAdmission(taskType);
+  if (!admission.accept) {
+    scheduler.recordMetric(taskType, 'droppedByAdmission');
+    res.setHeader('Retry-After', admission.retryAfter);
+    return res.status(503).json({ 
+      error: 'Admission rejected due to system pressure', 
+      type: taskType, 
+      retryAfter: admission.retryAfter 
+    });
+  }
+
   const taskData = { 
     ...req.body,
     id: req.body.id || `task-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -72,14 +92,7 @@ app.get('/health', (req, res) => {
 
 // GET /metrics — Clean metrics for monitoring/auto-scaling
 app.get('/metrics', (req, res) => {
-  const status = scheduler.getStatus();
-  res.json({
-    timestamp: new Date().toISOString(),
-    rps: currentRPS,
-    queueSize: status.queueSize,
-    totalActiveConnections: status.workers.reduce((acc, w) => acc + w.active, 0),
-    algorithm: status.algorithm
-  });
+  res.json(scheduler.getMetricsSnapshot());
 });
 
 // GET /queue — current scheduler state (for debugging/dashboard)
