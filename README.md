@@ -16,7 +16,9 @@ Traffic flows through the following highly optimized pipeline:
     1. **Interactive Pool**: Real-time SLA. Immediate execution. 200ms harsh deadline enforcement.
     2. **Compute Pool**: Heavy-duty SLA. Processes highly variated arbitrary complexity loads. Throttled based on `utilization = running_total_complexity / capacity`. Strict sleep emulation `1000 + (complexity / 10) * 3000ms`.
     3. **Batch Pool**: Deferred execution SLA. Absorbs unlimited bursts into an internal worker buffer queue before draining and scaling.
-* **Docker Orchestrator:** Programmatically spins up isolated container topologies locally and binds them back to the host via explicit Docker networking headers (`host.docker.internal`).
+* **Distributed Admission Control**: An intelligent API-Gateway-level circuit breaker calculating aggregated real-time system pressure (`(3i + 2c + 1b)/6`). Gracefully sheds low-priority tasks with intelligent HTTP `503 Retry-After` headers during peak overload before hitting execution queues.
+* **Granular Telemetry Pipeline**: Asynchronously streams 5-second interval metric snapshots natively to `logs/metrics.jsonl` tracking rolling latencies, worker limits, and gateway drop ratios.
+* **Docker Orchestrator**: Programmatically spins up isolated container topologies locally and binds them back to the host via explicit Docker networking headers (`host.docker.internal`).
 
 ## 🚀 How to Run locally via Docker
 
@@ -49,6 +51,5 @@ node test-traffic.js 15 150
 *Note: Heavy Compute tasks with excessive requests may beautifully and securely timeout out of the queue after 8000ms if concurrency limits are saturated.*
 
 ## 🛠 Future Roadmap
-- Metrics Collector (Rolling in-memory buffers for RPS and p95 latency)
 - Active Monitoring and Health pinging
 - ML Predictive Auto-Scaler (Holt-Winters forecasting for container pre-warming)
