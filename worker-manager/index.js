@@ -1,6 +1,37 @@
 const util = require('util');
 const exec = util.promisify(require('child_process').exec);
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+
+const logDir = path.join(__dirname, '../logs');
+fs.mkdirSync(logDir, { recursive: true });
+
+const POOL_LIMITS = {
+    interactive: { min: 1, max: 5 },
+    compute:     { min: 1, max: 4 },
+    batch:       { min: 1, max: 3 }
+};
+
+const COOLDOWN_MS = 60000;
+const AUTOSCALER_INTERVAL = 10000;
+const EMERGENCY_UTILIZATION = 0.90;
+const NORMAL_UTILIZATION = 0.70;
+const SPAWN_TIMEOUT_MS = 30000;
+const DRAIN_TIMEOUT_MS = 60000;
+const HEALTH_POLL_INTERVAL_MS = 500;
+
+const previousSnapshot = {
+    interactive: { queueDepth: 0 },
+    compute:     { queueDepth: 0 },
+    batch:       { queueDepth: 0 }
+};
+
+const lastActionTime = {
+    interactive: 0,
+    compute:     0,
+    batch:       0
+};
 
 // Track the workers we create: workerId -> mapped host port
 const activeWorkers = new Map();
@@ -25,13 +56,37 @@ async function spawnWorker(type = 'batch', workerIdStr = null, forcedPort = null
     const { stdout, stderr } = await exec(cmd);
     
     // Save to our local tracker
-    activeWorkers.set(workerId, port);
+    activeWorkers.set(workerId, { port, poolType: type, spawnedAt: Date.now() });
     console.log(`[WorkerManager] Container ${workerId} started (ID: ${stdout.trim().substring(0, 12)})`);
 
+    // Poll /health to ensure worker is ready before returning
+    console.log(`[WorkerManager] Waiting for ${workerId} to become healthy...`);
+    const startTime = Date.now();
+    let isHealthy = false;
+    while (Date.now() - startTime < 30000) {
+      try {
+        const res = await axios.get(`http://localhost:${port}/health`);
+        if (res.status === 200) {
+          isHealthy = true;
+          break;
+        }
+      } catch (err) {
+        // Container still starting up
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (!isHealthy) {
+      console.error(`[WorkerManager] Health check timeout for ${workerId}. Destroying zombie container.`);
+      activeWorkers.delete(workerId);
+      await exec(`docker rm -f ${workerId}`).catch(() => {});
+      throw new Error(`Health check timeout for ${workerId} after 30 seconds.`);
+    }
+
     // No need to manually post to /register anymore! Heartbeat handles it!
-    console.log(`[WorkerManager] Relying on Heartbeat to register ${workerId} ...`);
+    console.log(`[WorkerManager] ${workerId} is healthy! Relying on Heartbeat to register...`);
     
-    return { workerId, port, status: 'spawned' };
+    return { workerId, port, poolType: type, status: 'spawned' };
   } catch (err) {
     console.error(`[WorkerManager] Failed to spawn ${workerId}:`, err.message);
     throw err;
@@ -46,18 +101,45 @@ async function stopWorker(workerId) {
     throw new Error(`${workerId} is not tracked by WorkerManager.`);
   }
 
-  console.log(`[WorkerManager] Stopping and destroying ${workerId}...`);
-  const cmd = `docker rm -f ${workerId}`;
+  const port = activeWorkers.get(workerId).port;
+  console.log(`[WorkerManager] Draining and stopping ${workerId}...`);
   
   try {
-    await exec(cmd);
+    // 1. Send drain signal
+    await axios.post(`http://localhost:${port}/drain`).catch(() => {});
+
+    // 2. Poll for 60 seconds waiting for activeConnections to drop to 0
+    let drainComplete = false;
+    const startDrain = Date.now();
+    
+    while (Date.now() - startDrain < DRAIN_TIMEOUT_MS) {
+      try {
+        const healthRes = await axios.get(`http://localhost:${port}/health`);
+        if (healthRes.data && healthRes.data.activeConnections === 0) {
+          drainComplete = true;
+          break;
+        }
+      } catch (e) {
+        // if health fails during drain, consider it dead/drained
+        drainComplete = true;
+        break;
+      }
+      await new Promise(r => setTimeout(r, HEALTH_POLL_INTERVAL_MS));
+    }
+
+    if (!drainComplete) {
+      console.warn(`[WorkerManager] Drain timeout for ${workerId} exceeded 60s. Forcefully proceeding.`);
+    }
+
+    // 3. Unregister from load balancer
+    await axios.delete(`http://localhost:3000/deregister/${workerId}`).catch(() => {});
+    console.log(`[WorkerManager] Deregistered ${workerId} from Load Balancer.`);
+
+    // 4. Destroy container and clear map
+    await exec(`docker rm -f ${workerId}`);
     activeWorkers.delete(workerId);
     console.log(`[WorkerManager] Container ${workerId} destroyed.`);
 
-    // Tell Load Balancer to remove it from routing
-    await axios.delete(`http://localhost:3000/deregister/${workerId}`);
-    console.log(`[WorkerManager] Deregistered ${workerId} from Load Balancer.`);
-    
     return { workerId, status: 'stopped' };
   } catch (err) {
     console.error(`[WorkerManager] Failed to stop ${workerId}:`, err.message);
@@ -69,7 +151,60 @@ async function stopWorker(workerId) {
  * Simply returns the list of workers this manager has spawned
  */
 function getActiveWorkers() {
-  return Array.from(activeWorkers.entries()).map(([id, port]) => ({ id, port }));
+  return Array.from(activeWorkers.entries()).map(([id, data]) => ({ id, ...data }));
 }
 
-module.exports = { spawnWorker, stopWorker, getActiveWorkers };
+function getWorkerCountByPool() {
+  const counts = { interactive: 0, compute: 0, batch: 0 };
+  for (const data of activeWorkers.values()) {
+    if (counts[data.poolType] !== undefined) {
+      counts[data.poolType]++;
+    }
+  }
+  return counts;
+}
+
+function logDecision(pool, action, reason, workersBefore, workersAfter, trigger) {
+  const logObject = {
+      timestamp: Date.now(),
+      pool,
+      action,
+      reason,
+      workersBefore,
+      workersAfter,
+      trigger
+  };
+  
+  const logFile = path.join(logDir, 'scaling_decisions.jsonl');
+  fs.appendFileSync(logFile, JSON.stringify(logObject) + '\n');
+}
+
+// ─── Autoscaler Loop ───────────────────────────────────────────────────────────
+setInterval(async () => {
+  try {
+    const statusRes = await axios.get('http://localhost:3000/status');
+    const aggregatedStatus = statusRes.data;
+    const currentWorkerCounts = getWorkerCountByPool();
+
+    for (const pool of ['interactive', 'compute', 'batch']) {
+      const status = aggregatedStatus[pool];
+      if (!status) continue;
+
+      const workerCount = currentWorkerCounts[pool];
+      const utilization = workerCount === 0 ? 0 : status.activeWorkers / workerCount;
+      const queueGrowing = status.queueDepth > previousSnapshot[pool].queueDepth;
+      
+      // ─── Emergency Check ───
+      // (To be implemented in Step 7)
+
+      // ─── Normal Scale Up/Down ───
+      // (To be implemented in Step 7)
+      
+      previousSnapshot[pool].queueDepth = status.queueDepth;
+    }
+  } catch (err) {
+    console.error(`[Autoscaler] Skipping cycle, failed to read status: ${err.message}`);
+  }
+}, AUTOSCALER_INTERVAL);
+
+module.exports = { spawnWorker, stopWorker, getActiveWorkers, getWorkerCountByPool, logDecision };

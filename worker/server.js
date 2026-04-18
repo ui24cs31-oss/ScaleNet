@@ -13,6 +13,7 @@ const CAPACITY    = process.env.CAPACITY    || (WORKER_TYPE === 'compute' ? 2 : 
 // ─── State ─────────────────────────────────────────────────────────────────────
 let activeConnections = 0;
 let totalProcessed    = 0;
+let isDraining        = false;
 let localRunningTotalComplexity = 0;
 const latencyHistory  = []; // keeps last 100 latencies
 
@@ -49,6 +50,11 @@ app.use(morgan('dev'));
  * Handle incoming tasks based on worker role
  */
 app.post('/task', async (req, res) => {
+  if (isDraining) {
+    console.log(`[${WORKER_ID}] Rejected task ${req.body.id} because worker is draining`);
+    return res.status(503).json({ error: 'Worker is draining, not accepting new tasks', workerId: WORKER_ID });
+  }
+
   const { id, type, enqueuedAt, complexity = 1 } = req.body;
 
   // 1. Interactive Worker Behavior
@@ -174,6 +180,17 @@ app.get('/health', (req, res) => {
   });
 });
 
+// POST /drain — stop accepting new tasks gracefully
+app.post('/drain', (req, res) => {
+  isDraining = true;
+  console.log(`[${WORKER_ID}] 🛑 DRAIN REQUESTED. Stop accepting tasks. Active connections: ${activeConnections}`);
+  res.json({
+    success: true,
+    message: `Worker ${WORKER_ID} is now draining`,
+    activeConnections
+  });
+});
+
 // ─── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n✅ ${WORKER_TYPE.toUpperCase()} Worker [${WORKER_ID}] listening on port ${PORT}`);
@@ -192,10 +209,7 @@ setInterval(async () => {
       body: JSON.stringify({
         workerId: WORKER_ID,
         poolType: WORKER_TYPE,
-        activeConnections: activeConnections,
-        capacity: CAPACITY,
-        runningTotalComplexity: WORKER_TYPE === 'compute' ? localRunningTotalComplexity : 0,
-        healthy: true,
+        healthy: !isDraining,
         port: PORT
       })
     });

@@ -149,7 +149,7 @@ function removeFromEligible(workerId, type) {
 
 // ─── Heartbeat Management ──────────────────────────────────────────
 function onHeartbeat(payload) {
-  const { workerId, poolType, activeConnections, capacity, runningTotalComplexity, healthy, port } = payload;
+  const { workerId, poolType, healthy, port } = payload;
   const pool = pools[poolType];
   if (!pool) return;
 
@@ -160,9 +160,9 @@ function onHeartbeat(payload) {
     const workerPort = port || workerId.split('-')[1]; // Fallback to string split if old payload
     worker = {
       id: workerId,
-      capacity: capacity,
-      activeConnections: activeConnections,
-      runningTotalComplexity: runningTotalComplexity || 0,
+      capacity: poolType === 'compute' ? 2 : 5,
+      activeConnections: 0,
+      runningTotalComplexity: 0,
       arrayIndex: -1,
       healthy: healthy,
       lastHeartbeat: Date.now(),
@@ -172,10 +172,7 @@ function onHeartbeat(payload) {
     pool.workerMap.set(workerId, worker);
     console.log(`[Scheduler] Dynamically registered ${workerId} via heartbeat in ${poolType} pool`);
   } else {
-    // Update existing
-    worker.activeConnections = activeConnections;
-    worker.runningTotalComplexity = runningTotalComplexity || 0;
-    worker.capacity = capacity;
+    // Update existing (do not overwrite activeConnections / complexity!)
     worker.healthy = healthy;
     worker.lastHeartbeat = Date.now();
   }
@@ -526,6 +523,29 @@ function getStatus() {
   return status;
 }
 
+function getAggregatedStatus() {
+  const raw = getStatus();  
+  const result = {};
+  
+  for (const poolType of ['interactive', 'compute', 'batch']) {
+      const workers = raw.workerPools[poolType] || [];
+      const queueDepth = raw.queues[poolType] || 0;
+      
+      const activeWorkers = workers.filter(w => w.active > 0).length;
+      const idleWorkers = workers.filter(w => w.active === 0 && w.eligible).length;
+      const workerCount = workers.length;
+      
+      result[poolType] = {
+          queueDepth,
+          activeWorkers,
+          idleWorkers,
+          workerCount
+      };
+  }
+  
+  return result;
+}
+
 function setAlgorithm() { return false; }
 function getAlgorithm() { return 'P2C / O(1)'; }
 
@@ -534,6 +554,7 @@ module.exports = {
     addWorker, 
     removeWorker, 
     getStatus, 
+    getAggregatedStatus,
     onHeartbeat,
     setAlgorithm,
     getAlgorithm,

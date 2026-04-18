@@ -100,6 +100,11 @@ app.get('/queue', (req, res) => {
   res.json(scheduler.getStatus());
 });
 
+// GET /status — aggregated status explicitly for Autoscaler loop
+app.get('/status', (req, res) => {
+  res.json(scheduler.getAggregatedStatus());
+});
+
 // POST /register — Worker Manager calls this to add a new worker
 app.post('/register', (req, res) => {
   const { id, url, type } = req.body;
