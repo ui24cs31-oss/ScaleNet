@@ -293,8 +293,16 @@ function isModelLoaded() {
  * @returns {Object|null}
  */
 function getModelInfo() {
-  if (!modelMetadata) return null;
-  return { ...modelMetadata };
+  if (!modelMetadata || !modelWeights) return null;
+  return { 
+    ...modelMetadata,
+    classWeights: Object.fromEntries(
+      Object.entries(modelWeights).map(([cls, { weights, bias }]) => [
+        cls,
+        { weights: weights.map(w => parseFloat(w.toFixed(4))), bias: parseFloat(bias.toFixed(4)) }
+      ])
+    )
+  };
 }
 
 module.exports = { train, predict, loadModel, isModelLoaded, getModelInfo };

@@ -191,14 +191,51 @@ setInterval(async () => {
       if (!status) continue;
 
       const workerCount = currentWorkerCounts[pool];
-      const utilization = workerCount === 0 ? 0 : status.activeWorkers / workerCount;
+      const utilization = workerCount === 0 ? 1 : status.activeWorkers / workerCount;
       const queueGrowing = status.queueDepth > previousSnapshot[pool].queueDepth;
       
+      const timeSinceLastAction = Date.now() - lastActionTime[pool];
+      const inCooldown = timeSinceLastAction < COOLDOWN_MS;
+
       // ─── Emergency Check ───
-      // (To be implemented in Step 7)
+      // Bypass cooldown if things are really bad
+      if (utilization >= EMERGENCY_UTILIZATION || (status.queueDepth > 15 && queueGrowing)) {
+        if (workerCount < POOL_LIMITS[pool].max) {
+          console.log(`[Autoscaler] 🚨 EMERGENCY Scale UP triggered for ${pool} pool! Util: ${(utilization * 100).toFixed(1)}%, Queue: ${status.queueDepth}`);
+          spawnWorker(pool).catch(e => console.error(`[Autoscaler] Failed to spawn emergency worker: ${e.message}`));
+          lastActionTime[pool] = Date.now();
+          logDecision(pool, 'SCALE_UP_EMERGENCY', `High util/queue`, workerCount, workerCount + 1, 'emergency');
+          previousSnapshot[pool].queueDepth = status.queueDepth;
+          continue;
+        }
+      }
+
+      if (inCooldown) {
+          previousSnapshot[pool].queueDepth = status.queueDepth;
+          continue;
+      }
 
       // ─── Normal Scale Up/Down ───
-      // (To be implemented in Step 7)
+      if (utilization >= NORMAL_UTILIZATION || (status.queueDepth > 0 && queueGrowing)) {
+        if (workerCount < POOL_LIMITS[pool].max) {
+          console.log(`[Autoscaler] 📈 Normal Scale UP triggered for ${pool} pool. Util: ${(utilization * 100).toFixed(1)}%, Queue: ${status.queueDepth}`);
+          spawnWorker(pool).catch(e => console.error(`[Autoscaler] Failed to spawn normal worker: ${e.message}`));
+          lastActionTime[pool] = Date.now();
+          logDecision(pool, 'SCALE_UP', `Util >= ${NORMAL_UTILIZATION} or queue growing`, workerCount, workerCount + 1, 'normal');
+        }
+      } else if (utilization < 0.30 && status.idleWorkers > 0 && status.queueDepth === 0) {
+        if (workerCount > POOL_LIMITS[pool].min) {
+          // Find the last spawned worker in this pool
+          const poolWorkers = Array.from(activeWorkers.entries()).filter(([id, data]) => data.poolType === pool);
+          if (poolWorkers.length > 0) {
+              const workerToKill = poolWorkers[poolWorkers.length - 1][0]; // LIFO scaling down
+              console.log(`[Autoscaler] 📉 Normal Scale DOWN triggered for ${pool} pool. Util: ${(utilization * 100).toFixed(1)}%`);
+              stopWorker(workerToKill).catch(e => console.error(`[Autoscaler] Failed to stop worker: ${e.message}`));
+              lastActionTime[pool] = Date.now();
+              logDecision(pool, 'SCALE_DOWN', `Util < 0.30 & Idle > 0`, workerCount, workerCount - 1, 'normal');
+          }
+        }
+      }
       
       previousSnapshot[pool].queueDepth = status.queueDepth;
     }

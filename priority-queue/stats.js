@@ -11,7 +11,8 @@ const stats = {
   1: { received: 0, processed: 0, rejected: 0, totalWaitMs: 0 },
   2: { received: 0, processed: 0, rejected: 0, totalWaitMs: 0 },
   3: { received: 0, processed: 0, rejected: 0, totalWaitMs: 0 },
-  startedAt: Date.now()
+  startedAt: Date.now(),
+  lastConfidence: null
 };
 
 /**
@@ -75,8 +76,14 @@ function getStats() {
     uptimeSeconds,
     avgRPS: uptimeSeconds > 0 ? parseFloat((totalReceived / uptimeSeconds).toFixed(2)) : 0
   };
+  
+  snapshot.lastConfidence = stats.lastConfidence;
 
   return snapshot;
+}
+
+function recordConfidence(conf) {
+  stats.lastConfidence = conf;
 }
 
 /**
@@ -89,4 +96,4 @@ function resetStats() {
   stats.startedAt = Date.now();
 }
 
-module.exports = { recordReceived, recordProcessed, recordRejected, getStats, resetStats };
+module.exports = { recordReceived, recordProcessed, recordRejected, getStats, resetStats, recordConfidence };

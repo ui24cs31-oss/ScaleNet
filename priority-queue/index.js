@@ -5,7 +5,7 @@ const cors    = require('cors');
 const { config, updateConfig }    = require('./config');
 const { classifyByRules }         = require('./classifier');
 const { enqueue, getQueueDepths, startProcessor, peekQueue } = require('./queue-manager');
-const { getStats, resetStats }    = require('./stats');
+const { getStats, resetStats, recordConfidence }    = require('./stats');
 const { collectSample, getSampleCount, loadTrainingData, clearTrainingData } = require('./ml/collector');
 const { extractFeatures }         = require('./ml/features');
 const { train, predict, loadModel, isModelLoaded, getModelInfo } = require('./ml/model');
@@ -39,6 +39,7 @@ app.post('/task', (req, res) => {
       priority = prediction.priority;
       reason = `ML prediction (confidence: ${prediction.confidence})`;
       confidence = prediction.confidence;
+      recordConfidence(confidence);
     } else {
       // Fallback to rules if ML prediction fails
       const ruleResult = classifyByRules(body);
